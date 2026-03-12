@@ -32,7 +32,9 @@ import json
 import pydicom
 import zipfile
 from pipeline_utils import Pipeline
-
+import json
+from model_utils import *
+from stqdm import stqdm
 
 root_path = f'./roundel/'
 data_path = f'{root_path}/data/'
@@ -61,11 +63,15 @@ DISPLAY_W = 400
 N = 5
 st.session_state.N = N
 
-background_idx = 0
-rv_idx = 3
-lv_myo_idx = 2
-lv_idx = 1
-rv_myo_idx = 4
+
+with open("labels.json", "r") as f:
+    labels = json.load(f)
+
+background_idx = labels['background']
+lv_idx = labels['LV']
+rv_idx = labels['RV']
+lv_myo_idx = labels['LV_myo']
+rv_myo_idx = labels['RV_myo']
 
 BACKGROUND_COLOR = (10, 10, 10, 0) # THIS HAS TO BE NON-ZERO
 RV_MYO_COLOR = (0, 200, 10, 50)    # Green
@@ -115,13 +121,13 @@ def save_cached_mask(mask, save_path):
 def load_cached_mask(save_path):
     return np.load(save_path)
 
-def save_config(config: dict, path: str | Path) -> None:
+def save_config(config, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         json.dump(config, f, indent=2)
 
-def load_config(path: str | Path) -> dict:
+def load_config(path) :
     path = Path(path)
     with path.open("r") as f:
         return json.load(f)
@@ -151,66 +157,119 @@ def load_font(size):
 
 
 def segmentation_view():
+    print(1)
     
     st.header("Data Upload")
 
     if 'disable_upload' not in st.session_state:
         st.session_state['disable_upload'] = False
     
-    uploaded_files = st.file_uploader(
-        "Upload DICOM directory or ZIP of DICOM directory",
-        type=["dcm"],#, "zip"],
-        accept_multiple_files=True,
-        disabled = st.session_state['disable_upload']
-    )
-
-    if uploaded_files:
-        image, sax_df = Pipeline(uploaded_files)
-
-        first_dicom = uploaded_files[0]
-        first_dicom.seek(0)
-        dcm = pydicom.dcmread(first_dicom)
-
-        st.session_state.patient_name = str(dcm.PatientName)
-        st.session_state.series_date = str(dcm.SeriesDate)
-        st.session_state.series_description = str(dcm.SeriesDescription)
-        st.session_state.pixelspacing = sax_df.pixelspacing.unique()[0]
-        st.session_state.thickness = sax_df.thickness.unique()[0]
-        st.session_state['sax_series_uid'] = dcm.SeriesInstanceUID
-
-        n_slices = sax_df['slicelocation'].nunique()
-        n_phases = sax_df.loc[sax_df['slicelocation'] == sax_df['slicelocation'].values[0]]['triggertime'].nunique()
-
-        st.markdown(f"""
-        ### DICOM Metadata
-
-        **Patient Name:** {st.session_state.patient_name}  
-        **Series Date:** {st.session_state.series_date}  
-        **Series Description:** {st.session_state.series_description}  
-
-        **Pixel Size:** {st.session_state.pixelspacing} x {st.session_state.pixelspacing} mm  
-        **Slice Thickness:** {st.session_state.thickness} mm
-
-        **Number of Images:** {len(sax_df)} 
-        **Number of Slices:** {n_slices} 
-        **Number of Phases:** {n_phases}
-        **Slice x Phases = ** {n_slices * n_phases}
-        
-        """
+    col1, col2 = st.columns(2)
+    with col1:
+        uploaded_files = st.file_uploader(
+            "Upload DICOM directory or ZIP of DICOM directory",
+            type=["dcm"],#, "zip"],
+            accept_multiple_files=True,
+            disabled = st.session_state['disable_upload']
         )
 
-        if st.button("Confirm DICOMs"):
-            st.session_state['disable_upload'] = True
-            segment_image(image)
-            st.success('Confirmed')
-            initialize_app()
+    with col2:
+        if uploaded_files:
+            image, sax_df = Pipeline(uploaded_files)
 
+            first_dicom = uploaded_files[0]
+            first_dicom.seek(0)
+            dcm = pydicom.dcmread(first_dicom)
 
+            st.session_state.patient_name = str(dcm.PatientName)
+            st.session_state.series_date = str(dcm.SeriesDate)
+            st.session_state.series_description = str(dcm.SeriesDescription)
+            st.session_state.pixelspacing = sax_df.pixelspacing.unique()[0]
+            st.session_state.thickness = sax_df.thickness.unique()[0]
+            st.session_state['sax_series_uid'] = dcm.SeriesInstanceUID
 
+            n_slices = sax_df['slicelocation'].nunique()
+            n_phases = sax_df.loc[sax_df['slicelocation'] == sax_df['slicelocation'].values[0]]['triggertime'].nunique()
+            # Create dataframe
+            dicom_data = {
+                "Field": [
+                    "Patient Name",
+                    "Series Date",
+                    "Series Description",
+                    "Pixel Size",
+                    "Slice Thickness",
+                    "Number of Images",
+                    "Number of Slices",
+                    "Number of Phases",
+                    "Slice × Phases"
+                ],
+                "Value": [
+                    st.session_state.patient_name,
+                    st.session_state.series_date,
+                    st.session_state.series_description,
+                    f"{st.session_state.pixelspacing} x {st.session_state.pixelspacing} mm",
+                    f"{st.session_state.thickness} mm",
+                    len(sax_df),
+                    n_slices,
+                    n_phases,
+                    n_slices * n_phases
+                ]
+            }
+
+            df_dicom = pd.DataFrame(dicom_data).set_index('Field')
+
+            # Display dataframe in Streamlit
+            st.dataframe(df_dicom, use_container_width=True)
+
+    if uploaded_files:
+        # if st.button("Segment!", use_container_width=True, type = 'primary'):
+        st.session_state['disable_upload'] = True
+        if "initialized_all" not in st.session_state:
+            with st.spinner("Segmenting..."):
+                segment_image(image)
+            
+            with st.spinner("Initialising..."):
+                initialize_app()
+                st.success('Confirmed')
 
 
 def segment_image(image):
-    mask = np.zeros_like(image)
+    # Crop and pad the image to correct shape
+
+    st.session_state['model'] = tf.keras.models.load_model('UNet3plus.h5', 
+                                    compile = False,
+                                    custom_objects={"InstanceNormalization":InstanceNormalization,
+                                                    "ResizeAndConcatenate":ResizeAndConcatenate})
+
+    target_shape = (256,256)
+    mask = []
+    for t in stqdm(range(image.shape[-1])):  
+        image_cropped, meta =  crop_pad_image_only(image[..., t], target_shape = target_shape)
+        X = z_normalise_image(image_cropped)[np.newaxis,...,np.newaxis]
+        pred_mask = sliding_window_inference_3d(
+                        st.session_state.model,
+                        X,                   # np.ndarray [batch_size,Y,X,Z,1] already preprocessed & normalised
+                        patch_size=[256,256,10],
+                        overlap=0.5,
+                        apply_softmax=False,       # set False as the model already uses softmax activation
+                        out_channels=5,    # if known, can be set to avoid dry run
+                        tta=False,                 # Whether to use test-time augmentation (flips)
+                        plot_tta=False,           # Whether to plot the prediction after each TTA variant (for debugging)
+                        scan_id = None,           # used for naming the TTA variant plots
+                        time_step_counter=0, # used for naming the TTA variant plots
+                        gaussian_sigma_scale=1/8, # controls how peaked the Gaussian is
+                        deep_supervision=True,
+                        run = None               # neptune run instance for logging
+                    )
+        pred_mask = reverse_crop_pad(pred_mask, meta)
+
+        mask.append(pred_mask)
+    mask = np.stack(mask, -1)
+#     return mask
+
+
+# def segment_image(image):
+#     mask = np.zeros_like(image)
     save_image(image, save_path=f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
     save_mask(mask, save_path=f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz')
 
@@ -218,132 +277,143 @@ def segment_image(image):
 # Initialization
 # --------------------------------------------------------------
 def initialize_app():
-    raw_image = load_nii(f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
-    raw_mask = load_nii(f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz').astype('uint8')
+    print(2)
 
-    raw_mask = np.eye(st.session_state.N, dtype=np.uint8)[raw_mask]
-    raw_shape = raw_image.shape
+    stages = 5
+    with stqdm(total=stages) as pbar:
+        raw_image = load_nii(f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
+        raw_mask = load_nii(f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz').astype('uint8')
 
-    # -----------------------------
-    # Compute raw indices
-    # -----------------------------
-    lv_volume = np.sum(raw_mask[...,lv_idx], axis=(0,1,2))
-    rv_volume = np.sum(raw_mask[...,rv_idx], axis=(0,1,2))
+        raw_mask = np.eye(st.session_state.N, dtype=np.uint8)[raw_mask]
+        raw_shape = raw_image.shape
 
-    if np.max(lv_volume) == 0:
-        raw_lv_dia_idx = 0
-        raw_lv_sys_idx = 15
+        # -----------------------------
+        # Compute raw indices
+        # -----------------------------
+        lv_volume = np.sum(raw_mask[...,lv_idx], axis=(0,1,2))
+        rv_volume = np.sum(raw_mask[...,rv_idx], axis=(0,1,2))
 
-        raw_rv_dia_idx = 0
-        raw_rv_sys_idx = 15
+        if np.max(lv_volume) == 0:
+            raw_lv_dia_idx = 0
+            raw_lv_sys_idx = 15
 
-    else:
-        raw_lv_dia_idx = int(np.argmax(lv_volume))
-        raw_lv_sys_idx = np.where(lv_volume != 0)[0][np.argmin(lv_volume[lv_volume != 0])]
+            raw_rv_dia_idx = 0
+            raw_rv_sys_idx = 15
 
-        raw_rv_dia_idx = int(np.argmax(rv_volume))
-        raw_rv_sys_idx = np.where(rv_volume != 0)[0][np.argmin(rv_volume[rv_volume != 0])]
+        else:
+            raw_lv_dia_idx = int(np.argmax(lv_volume))
+            raw_lv_sys_idx = np.where(lv_volume != 0)[0][np.argmin(lv_volume[lv_volume != 0])]
 
-    st.session_state.raw = {
-        "image": raw_image,
-        "mask": raw_mask,
-        "shape": raw_shape,
-        "raw_lv_dia_idx": raw_lv_dia_idx,
-        "raw_lv_sys_idx": raw_lv_sys_idx,
-        "raw_rv_dia_idx":raw_rv_dia_idx,
-        "raw_rv_sys_idx":raw_rv_sys_idx
-    }
+            raw_rv_dia_idx = int(np.argmax(rv_volume))
+            raw_rv_sys_idx = np.where(rv_volume != 0)[0][np.argmin(rv_volume[rv_volume != 0])]
 
-    # -----------------------------
-    # Initialize EDV/ESV selection
-    # -----------------------------
-    if "edv_esv_selected" not in st.session_state:
-        st.session_state['edv_esv_selected'] = {"lv_dia_idx": None, "lv_sys_idx": None,"rv_dia_idx": None, "rv_sys_idx": None, "confirmed": False}
+        st.session_state.raw = {
+            "image": raw_image,
+            "mask": raw_mask,
+            "shape": raw_shape,
+            "raw_lv_dia_idx": raw_lv_dia_idx,
+            "raw_lv_sys_idx": raw_lv_sys_idx,
+            "raw_rv_dia_idx":raw_rv_dia_idx,
+            "raw_rv_sys_idx":raw_rv_sys_idx
+        }
 
-    # -----------------------------
-    # Preprocess / crop if required
-    # -----------------------------
-    mask_channels = [i for i in range(st.session_state.N) if i != background_idx]
+        # -----------------------------
+        # Initialize EDV/ESV selection
+        # -----------------------------
+        if "edv_esv_selected" not in st.session_state:
+            st.session_state['edv_esv_selected'] = {"lv_dia_idx": None, "lv_sys_idx": None,"rv_dia_idx": None, "rv_sys_idx": None, "confirmed": False}
 
-    x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[...,mask_channels], axis=(-1,-2,-3)), crop_factor=1.5)
-    st.session_state['subpixel_resolution'] = 2
+        # -----------------------------
+        # Preprocess / crop if required
+        # -----------------------------
+        mask_channels = [i for i in range(st.session_state.N) if i != background_idx]
 
-    preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
-    preprocessed_mask = raw_mask[y_min:y_max, x_min:x_max, :, :, :].astype('uint8')
-    H, W, D, T, N = preprocessed_mask.shape
+        x_min, y_min, x_max, y_max = find_crop_box(np.max(raw_mask[...,mask_channels], axis=(-1,-2,-3)), crop_factor=1.5)
+        st.session_state['subpixel_resolution'] = 2
 
-    has_masks = np.where(np.sum(preprocessed_mask[...,mask_channels], axis = (0,1,3,-1))>0)[0]
-    if len(has_masks) == 0:
-        has_masks = np.array([1,2,3,4,5,6])
+        preprocessed_image = raw_image[y_min:y_max, x_min:x_max, :, :]
+        preprocessed_mask = raw_mask[y_min:y_max, x_min:x_max, :, :, :].astype('uint8')
+        H, W, D, T, N = preprocessed_mask.shape
 
-    mid_slice = len(has_masks)//2
-    
+        pbar.update(1)
 
-    zoom = [st.session_state['subpixel_resolution'],st.session_state['subpixel_resolution'],1,1]
-    smoothed_image = cv_zoom(preprocessed_image, zoom = zoom)
+        has_masks = np.where(np.sum(preprocessed_mask[...,mask_channels], axis = (0,1,3,-1))>0)[0]
+        if len(has_masks) == 0:
+            has_masks = np.array([1,2,3,4,5,6])
 
+        mid_slice = len(has_masks)//2
+        
 
-    st.session_state['cache_config_path'] = f"{cache_dir}/config___{st.session_state.sax_series_uid}.json"
-    st.session_state['cache_mask_path'] = f"{cache_dir}/masks___{st.session_state.sax_series_uid}.npy"
-
-    if os.path.exists(st.session_state['cache_config_path']) and os.path.exists(st.session_state['cache_mask_path']):
-        smoothed_mask = load_cached_mask(st.session_state['cache_mask_path']).astype("uint8")
-        cached = True
-    else:
-        smoothed_mask = cv_zoom_mask(
-            preprocessed_mask,
-            zoom=zoom + [1],
-            interpolation=cv2.INTER_NEAREST,
-        )
-        cached = False
-
-    make_video(smoothed_image[:,:,has_masks[mid_slice-3:mid_slice+3],:], smoothed_mask[:,:,has_masks[mid_slice-3:mid_slice+3],:, :] * 0, save_file=edv_esv_gif_path)
-    make_video(smoothed_image, smoothed_mask*0, save_file=blank_gif_path)
+        zoom = [st.session_state['subpixel_resolution'],st.session_state['subpixel_resolution'],1,1]
+        smoothed_image = cv_zoom(preprocessed_image, zoom = zoom)
 
 
-    gif = Image.open(f'{edv_esv_gif_path}.gif')
+        st.session_state['cache_config_path'] = f"{cache_dir}/config___{st.session_state.sax_series_uid}.json"
+        st.session_state['cache_mask_path'] = f"{cache_dir}/masks___{st.session_state.sax_series_uid}.npy"
 
-    st.session_state.preprocessed = {
-        "image": preprocessed_image,
-        "mask": preprocessed_mask,
-        "smooth_image": smoothed_image,
-        "smooth_mask": smoothed_mask,
-        "H": H,
-        "W": W,
-        "D": D,
-        "T": T,
-        "N": N,
-        "edv_esv_frames": [frame.copy() for frame in ImageSequence.Iterator(gif)],
-        "crop_box": [x_min, y_min, x_max, y_max],
-    }
+        pbar.update(1)
+
+        if os.path.exists(st.session_state['cache_config_path']) and os.path.exists(st.session_state['cache_mask_path']):
+            smoothed_mask = load_cached_mask(st.session_state['cache_mask_path']).astype("uint8")
+            cached = True
+        else:
+            smoothed_mask = cv_zoom_mask(
+                preprocessed_mask,
+                zoom=zoom + [1],
+                interpolation=cv2.INTER_NEAREST,
+            )
+            cached = False
+
+        make_video(smoothed_image[:,:,has_masks[mid_slice-3:mid_slice+3],:], smoothed_mask[:,:,has_masks[mid_slice-3:mid_slice+3],:, :] * 0, save_file=edv_esv_gif_path)
+        pbar.update(1)
+        make_video(smoothed_image, smoothed_mask*0, save_file=blank_gif_path)
+        pbar.update(1)
 
 
-    st.session_state[f'edited_mask_lv'] = np.zeros_like(st.session_state.preprocessed["smooth_mask"])
-    st.session_state[f'edited_mask_rv'] = np.zeros_like(st.session_state.preprocessed["smooth_mask"])
+        gif = Image.open(f'{edv_esv_gif_path}.gif')
 
-    if cached:
-        config = load_config(st.session_state['cache_config_path'])
-        confirm_selection(lv_dia_idx=config['lv_dia_idx'], 
-                          rv_dia_idx=config['rv_dia_idx'], 
-                          lv_sys_idx=config['lv_sys_idx'], 
-                          rv_sys_idx=config['rv_sys_idx'])
+        st.session_state.preprocessed = {
+            "image": preprocessed_image,
+            "mask": preprocessed_mask,
+            "smooth_image": smoothed_image,
+            "smooth_mask": smoothed_mask,
+            "H": H,
+            "W": W,
+            "D": D,
+            "T": T,
+            "N": N,
+            "edv_esv_frames": [frame.copy() for frame in ImageSequence.Iterator(gif)],
+            "crop_box": [x_min, y_min, x_max, y_max],
+        }
 
-    # -----------------------------
-    # Initialize edited mask
-    # -----------------------------
 
-    st.session_state[f'mask_hash_lv'] = mask_hash(st.session_state.preprocessed["smooth_mask"])
-    st.session_state[f'mask_hash_rv'] = mask_hash(st.session_state.preprocessed["smooth_mask"])
-    st.session_state['lv_frames'] = None
-    st.session_state['rv_frames'] = None
-    st.session_state["view_mode"] = 'Static'
-    st.session_state["brush_mode"] = "Paint ✏️"
-    st.session_state["stroke_width"] = "thin"
-    st.session_state['edit_made'] = False
-    st.session_state['cached'] = cached
-    st.session_state["saved"] = False
+        st.session_state[f'edited_mask_lv'] = np.zeros_like(st.session_state.preprocessed["smooth_mask"])
+        st.session_state[f'edited_mask_rv'] = np.zeros_like(st.session_state.preprocessed["smooth_mask"])
 
-    st.session_state.initialized_all = True
+        if cached:
+            config = load_config(st.session_state['cache_config_path'])
+            confirm_selection(lv_dia_idx=config['lv_dia_idx'], 
+                            rv_dia_idx=config['rv_dia_idx'], 
+                            lv_sys_idx=config['lv_sys_idx'], 
+                            rv_sys_idx=config['rv_sys_idx'])
+
+        # -----------------------------
+        # Initialize edited mask
+        # -----------------------------
+
+        st.session_state[f'mask_hash_lv'] = mask_hash(st.session_state.preprocessed["smooth_mask"])
+        st.session_state[f'mask_hash_rv'] = mask_hash(st.session_state.preprocessed["smooth_mask"])
+        st.session_state['lv_frames'] = None
+        st.session_state['rv_frames'] = None
+        st.session_state["view_mode"] = 'Static'
+        st.session_state["brush_mode"] = "Paint ✏️"
+        st.session_state["stroke_width"] = "thin"
+        st.session_state['edit_made'] = False
+        st.session_state['cached'] = cached
+        st.session_state["saved"] = False
+        st.session_state.initialized_all = True
+
+
 
 def merge_masks(lv_mask, rv_mask):
     combined_mask = lv_mask + rv_mask
@@ -507,7 +577,6 @@ def make_video(image, mask, save_file, ventricle = 'all', mask_frames = 'all',sc
     H, W = image.shape[:2]
     GIF_H = H*GIF_W/W
     H_scaled, W_scaled = round(GIF_H * scale), round(GIF_W * scale)
-    img_min, img_max = np.min(image), np.max(image)
 
     try:
         font = load_font(int(18 * scale))
@@ -529,7 +598,8 @@ def make_video(image, mask, save_file, ventricle = 'all', mask_frames = 'all',sc
 
         for idx in range(position):
             row, col = divmod(idx, grid_cols)
-
+        
+            img_min, img_max = np.min(image[:,:,:,t]), np.max(image[:,:,:,t])
             img_slice = ((image[:,:,idx,t] - img_min) / (img_max - img_min + 1e-9) * 255).astype(np.uint8)
             img_rgb = np.stack([img_slice]*3, axis=-1)
             img_pil = Image.fromarray(img_rgb, mode="RGB").convert("RGBA")
@@ -834,7 +904,7 @@ def confirm_selection(lv_dia_idx, lv_sys_idx,rv_dia_idx, rv_sys_idx):
         "confirmed": True
     })
 
-    save_config(st.session_state.edv_esv_selected, st.session_state['cache_config_path'])
+    save_config(st.session_state['edv_esv_selected'], st.session_state['cache_config_path'])
 
     # LV
     copy_frames_channels('edited_mask_lv', lv_dia_idx, lv_sys_idx, lv_idx, lv_myo_idx)
@@ -871,6 +941,12 @@ def confirm_selection(lv_dia_idx, lv_sys_idx,rv_dia_idx, rv_sys_idx):
 
 def edv_esv_view():
     """Full EDV/ESV Finder view layout."""
+    print(3)
+
+    if not st.session_state['initialized_all']:
+        st.error("Select and confirm EDV/ESV first.")
+        st.stop()
+
     if "edv_esv_selected" not in st.session_state:
         st.session_state['edv_esv_selected'] = {"lv_dia_idx": None, "lv_sys_idx": None, "rv_dia_idx": None, "rv_sys_idx": None,"confirmed": False}
     
@@ -925,6 +1001,7 @@ def edv_esv_view():
 
     else:
         st.success("EDV | ESV Confirmed!")
+
 
 
 def slice_navigation(D):
@@ -1032,6 +1109,8 @@ def normalize(image):
 
 
 def mask_editor_view():
+    print(4)
+
     """Full Mask Editor layout."""
     if not st.session_state['edv_esv_selected']["confirmed"]:
         st.error("Select and confirm EDV/ESV first.")
@@ -1190,6 +1269,7 @@ def mask_editor_view():
             width = int(DISPLAY_W)
 
         st.image(view_image, width = width)
+
 
 def resize_to_original(edited_mask, raw_mask, crop_box, dia_idx, sys_idx, ventricle):
     """

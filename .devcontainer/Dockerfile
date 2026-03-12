@@ -1,30 +1,23 @@
-FROM python:3.10-slim
+# FROM tensorflow/tensorflow:2.9.1-gpu
 
-# System dependencies
-RUN apt-get update && apt-get install -y \
-    libopenexr-dev \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+FROM tensorflow/tensorflow:2.9.1-gpu
 
-# Python packages
-RUN pip install "pydicom>=2.4" "pylibjpeg>=1.4" "pylibjpeg-libjpeg>=1.4"
+RUN apt-get update && apt-get install -y libopenexr-dev
+RUN pip install tensorflow-mri tqdm pydicom h5py \
+tensorflow-addons scikit-learn scikit-image \
+neptune neptune_tensorflow_keras jupyter nibabel pydicom kaleido \
+albumentations typing_extensions --upgrade
+
+RUN apt-get update && apt-get install -y libopenexr-dev
 
 RUN pip install --no-cache-dir \
-    matplotlib \
-    nibabel \
-    numpy==1.22.4 \
-    pandas \
-    Pillow \
-    scikit-image==0.20.0 \
-    scikit-learn \
-    scipy \
-    tqdm \
-    opencv-python-headless==4.7.0.68 \
+    pydicom==2.2.2 \
+    pylibjpeg==1.4.0 \
+    pylibjpeg-libjpeg==1.3.4 \
+    pylibjpeg-openjpeg==1.3.2 \
     streamlit==1.40.1 \
-    streamlit_drawable_canvas \
-    imageio
+    stqdm \
+    streamlit_drawable_canvas 
 
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends fonts-dejavu-core && \
-    rm -rf /var/lib/apt/lists/*
+RUN pip uninstall protobuf -y
+RUN pip install protobuf==3.20.3
