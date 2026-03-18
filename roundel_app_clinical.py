@@ -2,6 +2,7 @@
 # Configure Streamlit page
 # --------------------------------------------------------------
 from roundel_utils import *
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 st.set_page_config(page_title="Roundel", page_icon="⭕️", layout='wide')
 
 # --------------------------------------------------------------

@@ -5,6 +5,8 @@ import tensorflow as tf
 from scipy.ndimage import gaussian_filter
 from scipy.ndimage import zoom
 from tensorflow_addons.layers import InstanceNormalization
+from scipy import ndimage
+from skimage.measure import label   
 
 # ---------- small utilities ----------
 def crop_pad_image_only(image, target_shape=(256,256)):
@@ -819,11 +821,57 @@ def sliding_window_inference_3d(
 
     # crop back to original size
     prob_map = _crop_from_pad(prob_padded, pads)  # [Y0,X0,Z0,C_out]
-    # print("Final prob map shape after cropping:", prob_map.shape)
-    # print(f"Min, median and max value in each channel of final prob map: {[(c, prob_map[..., c].min(), np.median(prob_map[..., c]), prob_map[..., c].max()) for c in range(prob_map.shape[-1])]}")
-    seg = get_one_hot(np.argmax(prob_map, axis=-1).astype(np.int16), out_channels)  # [Y0,X0,Z0,C_out]
-    # print("Final segmentation shape after arg-max and one-hot:", seg.shape)
-    # print("Min, median and max value in each channel of final seg map: ", [(c, seg[..., c].min(), np.median(seg[..., c]), seg[..., c].max()) for c in range(seg.shape[-1])])
 
-    prob_map = np.argmax(prob_map, -1)
-    return prob_map #prob_map, seg
+    seg = np.argmax(prob_map, -1)
+    return seg 
+
+
+def getLargestCC(segmentation):
+    labels = label(segmentation)
+    assert( labels.max() != 0 ) # assume at least 1 CC
+    largestCC = labels == np.argmax(np.bincount(labels.flat)[1:])+1
+    return largestCC
+
+
+def postprocess(mask):
+    """
+    mask: (H,W,Z,T) predicted mask for one channel (non-binary)
+    sum_mask: (H,W) reference mask (2D) for max heart area
+    Returns cleaned mask with only values from components intersecting sum_mask
+    """
+    one_hot_mask = get_one_hot(mask.astype(np.int16), 5)  # [Y0,X0,Z0,C_out]
+    sum_mask = np.sum(one_hot_mask[...,1:], axis = (-1, 2, 3))
+    sum_mask = sum_mask > (np.quantile(sum_mask, 0.95)).astype(int)
+    sum_mask = getLargestCC(sum_mask)
+    H, W, Z, T = mask.shape
+    keep_mask_time = []
+
+    for t in range(T):
+        keep_mask_slice = []
+
+        for z in range(Z):
+            slice_mask = mask[..., z, t]
+
+            # create boolean mask of nonzero values
+            nonzero = slice_mask != 0
+
+            # label connected components on nonzero values
+            labeled, n = ndimage.label(nonzero)
+
+            # find labels that intersect the reference mask
+            touching_labels = np.unique(labeled[sum_mask > 0])
+            if touching_labels.size == 0:
+                keep_mask_slice.append(np.zeros_like(slice_mask))
+                continue
+
+            # keep original values for touching components
+            keep = np.isin(labeled, touching_labels)
+            cleaned_slice = np.where(keep, slice_mask, 0)
+
+            keep_mask_slice.append(cleaned_slice)
+
+        keep_mask_slice = np.stack(keep_mask_slice, axis=-1)
+        keep_mask_time.append(keep_mask_slice)
+
+    keep_mask_time = np.stack(keep_mask_time, axis=-1)
+    return keep_mask_time

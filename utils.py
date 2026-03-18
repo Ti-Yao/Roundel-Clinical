@@ -1,3 +1,6 @@
+from dicom_utils import *
+from model_utils import *
+
 import os
 import glob
 import math
@@ -31,9 +34,7 @@ import cv2
 import json
 import pydicom
 import zipfile
-from pipeline_utils import Pipeline
 import json
-from model_utils import *
 from stqdm import stqdm
 
 root_path = f'./roundel/'
@@ -47,13 +48,15 @@ edv_esv_gif_path = f'{results_path}/temp/edv_esv'
 edited_gif_path = f'{results_path}/temp/edited_edv_esv'
 raw_curve_path = f'{results_path}/temp/raw_metrics.png'
 edited_curve_path = f'{results_path}/temp/edited_metrics.png'
+dicom_mask_path = f'{results_path}/masks/dicoms/'
+nifti_mask_path = f'{results_path}/masks/nifti/'
+
 cache_dir = f'{root_path}/cache/'
 final_dir = f'{results_path}/results.zip'
 
 os.makedirs(f'{data_path}', exist_ok=True)
 os.makedirs(f'{results_path}/temp', exist_ok=True)
 os.makedirs(f'{results_path}/gifs', exist_ok=True)
-os.makedirs(f'{results_path}/masks', exist_ok=True)
 os.makedirs(f'{results_path}/edited_sax_df', exist_ok=True)
 os.makedirs(cache_dir, exist_ok=True)
 
@@ -140,6 +143,7 @@ def load_config(path) :
         return json.load(f)
 
 def save_mask(mask, save_path):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     nib_mask = nib.Nifti1Image(mask, affine=np.eye(4), dtype='uint8')
     nib.save(nib_mask, save_path)
 
@@ -238,7 +242,7 @@ def cv_zoom_mask(
         labels[epi] = myo_idx
         labels[endo] = endo_idx
 
-    return np.eye(N, dtype=np.uint8)[labels]
+    return np.eye(st.session_state['N'], dtype=np.uint8)[labels]
 
 def format_delta(value, raw_value, suffix="", round_digits=None):
     if round_digits is not None:
@@ -326,7 +330,7 @@ def make_video(image, mask, save_file, ventricle = 'all', mask_frames = 'all',sc
     H_scaled, W_scaled = round(GIF_H * scale), round(GIF_W * scale)
 
     try:
-        font = load_font(int(18 * scale))
+        font = load_font(int(20 * scale))
     except:
         font = ImageFont.load_default()
 
@@ -346,9 +350,14 @@ def make_video(image, mask, save_file, ventricle = 'all', mask_frames = 'all',sc
         for idx in range(position):
             row, col = divmod(idx, grid_cols)
         
-            img_min, img_max = np.min(image[:,:,:,t]), np.max(image[:,:,:,t])
-            img_slice = ((image[:,:,idx,t] - img_min) / (img_max - img_min + 1e-9) * 255).astype(np.uint8)
-            img_rgb = np.stack([img_slice]*3, axis=-1)
+            img_slice = image[:, :, idx, t]
+
+            p1, p99 = np.percentile(img_slice, [0.5, 99.5]) # improve contrast
+            img_slice = np.clip(img_slice, p1, p99)
+
+            # Convert to RGB
+            img_slice_norm = ((img_slice - img_slice.min()) / (img_slice.max() - img_slice.min() + 1e-9) * 255).astype(np.uint8)
+            img_rgb = np.stack([img_slice_norm] * 3, axis=-1)
             img_pil = Image.fromarray(img_rgb, mode="RGB").convert("RGBA")
 
             # Resize slice

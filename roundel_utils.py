@@ -1,5 +1,6 @@
 from utils import *
 
+st.session_state['N'] = 5
 def segmentation_view():
     st.header("Data Upload")
 
@@ -8,31 +9,34 @@ def segmentation_view():
     
     col1, col2 = st.columns(2)
     with col1:
-        uploaded_files = st.file_uploader(
-            "Upload DICOM directory or ZIP of DICOM directory",
-            type=["dcm"],#, "zip"],
-            accept_multiple_files=True,
+        zip_file = st.file_uploader(
+            "Upload ZIP DICOM directory",
+            type=["zip"],
+            accept_multiple_files=False,
             disabled = st.session_state['disable_upload']
         )
+        if zip_file:
+            dcms = extract_dicom_from_zip(zip_file)
+            if dcms:
+                st.session_state['disable_upload'] = True
+                image, sax_df = Pipeline(dcms)
+                st.session_state['sax_df'] = sax_df
+                first_dcm = sax_df['dcm'].values[0]
+
+                st.session_state.patient_name = str(first_dcm.PatientName)
+                st.session_state.series_date = str(first_dcm.SeriesDate)
+                st.session_state.series_description = str(first_dcm.SeriesDescription)
+                st.session_state.pixelspacing = sax_df.pixelspacing.unique()[0]
+                st.session_state.thickness = sax_df.thickness.unique()[0]
+                st.session_state['sax_series_uid'] = first_dcm.SeriesInstanceUID
+
+                st.session_state.n_slices = sax_df['slicelocation'].nunique()
+                st.session_state.n_phases = sax_df.loc[sax_df['slicelocation'] == sax_df['slicelocation'].values[0]]['triggertime'].nunique()
+        
 
     with col2:
-        if uploaded_files:
-            image, sax_df = Pipeline(uploaded_files)
-
-            first_dicom = uploaded_files[0]
-            first_dicom.seek(0)
-            dcm = pydicom.dcmread(first_dicom)
-
-            st.session_state.patient_name = str(dcm.PatientName)
-            st.session_state.series_date = str(dcm.SeriesDate)
-            st.session_state.series_description = str(dcm.SeriesDescription)
-            st.session_state.pixelspacing = sax_df.pixelspacing.unique()[0]
-            st.session_state.thickness = sax_df.thickness.unique()[0]
-            st.session_state['sax_series_uid'] = dcm.SeriesInstanceUID
-
-            n_slices = sax_df['slicelocation'].nunique()
-            n_phases = sax_df.loc[sax_df['slicelocation'] == sax_df['slicelocation'].values[0]]['triggertime'].nunique()
-            # Create dataframe
+        # Create dataframe
+        if st.session_state['disable_upload']:
             dicom_data = {
                 "Field": [
                     "Patient Name",
@@ -51,10 +55,10 @@ def segmentation_view():
                     st.session_state.series_description,
                     f"{st.session_state.pixelspacing} x {st.session_state.pixelspacing} mm",
                     f"{st.session_state.thickness} mm",
-                    len(sax_df),
-                    n_slices,
-                    n_phases,
-                    n_slices * n_phases
+                    len(st.session_state['sax_df'] ),
+                    st.session_state.n_slices,
+                    st.session_state.n_phases,
+                    st.session_state.n_slices * st.session_state.n_phases
                 ]
             }
 
@@ -63,16 +67,14 @@ def segmentation_view():
             # Display dataframe in Streamlit
             st.dataframe(df_dicom, use_container_width=True)
 
-    if uploaded_files:
-        # if st.button("Segment!", use_container_width=True, type = 'primary'):
-        st.session_state['disable_upload'] = True
-        if "initialized_all" not in st.session_state:
-            with st.spinner("Segmenting..."):
-                segment_image(image)
-            
-            with st.spinner("Initialising..."):
-                initialize_app()
     
+    if "initialized_all" not in st.session_state and st.session_state['disable_upload']:
+        with st.spinner("Segmenting..."):
+            segment_image(image)
+        
+        with st.spinner("Initialising..."):
+            initialize_app()
+
     if "initialized_all" in st.session_state:
         st.success('Segmentation Confirmed! ⭕️')
 
@@ -80,7 +82,7 @@ def segmentation_view():
 def segment_image(image):
     # Crop and pad the image to correct shape
 
-    st.session_state['model'] = tf.keras.models.load_model('UNet3plus.h5', 
+    st.session_state['model'] = tf.keras.models.load_model('SAX-37.h5', 
                                     compile = False,
                                     custom_objects={"InstanceNormalization":InstanceNormalization,
                                                     "ResizeAndConcatenate":ResizeAndConcatenate})
@@ -109,6 +111,7 @@ def segment_image(image):
 
         mask.append(pred_mask)
     mask = np.stack(mask, -1)
+    mask = postprocess(mask)
     save_image(image, save_path=f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
     save_mask(mask, save_path=f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz')
 
@@ -122,7 +125,7 @@ def initialize_app():
         raw_image = load_nii(f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
         raw_mask = load_nii(f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz').astype('uint8')
 
-        raw_mask = np.eye(st.session_state.N, dtype=np.uint8)[raw_mask]
+        raw_mask = np.eye(st.session_state['N'], dtype=np.uint8)[raw_mask]
         raw_shape = raw_image.shape
 
         # -----------------------------
@@ -305,8 +308,6 @@ def edv_esv_view():
             type="primary",
             use_container_width=True
         )
-
-
     else:
         st.success("EDV | ESV Confirmed! 🔍")
 
@@ -524,7 +525,7 @@ def mask_editor_view():
                     st.rerun()
 
             with col_clear:
-                if st.button('Clear Slice', use_container_width=True):
+                if st.button('❌', use_container_width=True):
                     edited_mask[:, :, d, idx, :] = 0
                     combined_mask = merge_masks(st.session_state[f'edited_mask_lv'] , st.session_state[f'edited_mask_rv'])
                     save_cached_mask(combined_mask, save_path=st.session_state['cache_mask_path'])
@@ -700,8 +701,9 @@ def final_result_view():
         else:
             st.success('Masks and Metrics Saved! ✅')
 
-        # Save LV mask
-        save_mask(final_mask_2d, f'{results_path}/masks/{sax_series_uid}.nii.gz')
+        
+        save_mask(final_mask_2d, f'{nifti_mask_path}/{st.session_state.patient_name}.nii.gz')
+        save_mask_as_dicom_series(final_mask_2d, f'{dicom_mask_path}/{st.session_state.patient_name}')
 
         lv_df = pd.DataFrame({
             "sax_series_uid": [sax_series_uid],
@@ -736,7 +738,7 @@ def final_result_view():
         })
 
         combined_df = pd.concat([lv_df, rv_df], ignore_index=True)
-        combined_df.to_csv(f'{results_path}/edited_sax_df/{sax_series_uid}.csv', index=False)
+        combined_df.to_csv(f'{results_path}/edited_sax_df/{st.session_state.patient_name}.csv', index=False)
 
         st.session_state["saved"] = True
     
