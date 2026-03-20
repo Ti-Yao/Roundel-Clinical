@@ -2,8 +2,6 @@ import numpy as np
 import os
 import pandas as pd
 import glob
-from tqdm import tqdm
-import cv2
 import json
 import math
 import re
@@ -13,6 +11,7 @@ from scipy import stats
 import os
 import pickle
 from pathlib import Path
+import cv2
 from skimage.measure import label 
 import pydicom
 import streamlit as st

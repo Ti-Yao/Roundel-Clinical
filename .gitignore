@@ -1,5 +1,6 @@
+
 *pycache*
-data/julius
+data/
 results
 data/major_revisions
 *csv
@@ -7,3 +8,8 @@ data/major_revisions
 *png
 *h5
 roundel
+dist
+build
+installer 
+pyinstall
+*.exe

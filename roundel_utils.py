@@ -82,7 +82,7 @@ def segmentation_view():
 def segment_image(image):
     # Crop and pad the image to correct shape
 
-    st.session_state['model'] = tf.keras.models.load_model('SAX-37.h5', 
+    st.session_state['model'] = tf.keras.models.load_model(f'{models_path}/SAX-37.h5', 
                                     compile = False,
                                     custom_objects={"InstanceNormalization":InstanceNormalization,
                                                     "ResizeAndConcatenate":ResizeAndConcatenate})

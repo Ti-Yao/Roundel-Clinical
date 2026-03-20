@@ -37,9 +37,10 @@ import zipfile
 import json
 from stqdm import stqdm
 
-root_path = f'./roundel/'
-data_path = f'{root_path}/data/'
-results_path = f'{root_path}/results/'
+root_path = Path(__file__).resolve().parent
+data_path = str(root_path / "data")
+results_path = str(root_path / "results")
+models_path = str(root_path / "models")
 
 blank_gif_path = f'{results_path}/temp/blank'
 full_edited_gif_path = f'{results_path}/temp/edited'
@@ -63,8 +64,13 @@ os.makedirs(cache_dir, exist_ok=True)
 GIF_W = 150
 DISPLAY_W = 400
 
-with open("labels.json", "r") as f:
-    labels = json.load(f)
+labels = {
+  "background": 0,
+  "LV": 1,
+  "RV": 2,
+  "LV_myo": 3,
+  "RV_myo": 4
+}
 
 background_idx = labels['background']
 lv_idx = labels['LV']

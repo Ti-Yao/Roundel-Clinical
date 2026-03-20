@@ -1,0 +1,19 @@
+These are the steps I did in order:
+
+first make a requirements .txt (I used pip freeze)
+Then I made a venv for the app and installed the requirements and pyinstaller
+
+py -3.10 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+python -m pip install pyinstaller
+
+Then I used pyinstaller to create a local exe for the app (not the installer). The packages will often be missing so --collect all. For models and external files put them in a folder and --add-data. For windows use ';' for Linux/Max use ':' to map files.
+
+python -m PyInstaller --noconfirm --clean --onedir --console --name Roundel_Clinical --collect-all streamlit --collect-all streamlit-drawable-canvas --collect-all stqdm --collect-all nibabel --collect-all protobuf --collect-all pylibjpeg-libjpeg --collect-all pylibjpeg-openjpeg --collect-all tensorflow --collect-all matplotlib --collect-all skimage --collect-all cv2 --collect-all h5py --collect-all imageio --collect-all importlib_metadata --collect-all importlib_resources --collect-all keras --collect-all keras_preprocessing --collect-all numpy --collect-all pandas --collect-all PIL --collect-all protobuf --collect-all pydicom --collect-all pylibjpeg --collect-all pylibjpeg_libjpeg --collect-all pylibjpeg_openjpeg --collect-all sklearn --collect-all scipy --collect-all stqdm --collect-all streamlit_drawable_canvas --collect-all tensorflow_addons --collect-all tqdm --collect-all typing_extensions --hidden-import=matplotlib.animation --add-data "roundel_app_clinical.py;." --add-data "dicom_utils.py;." --add-data "utils.py;." --add-data "roundel_utils.py;." --add-data "model_utils.py;." --add-data "models;models" launcher_template.py
+
+Download vs_redist.x64.exe from the internet
+
+Then I use Inno setup complier (downloaded for windows), and compile the .iss.
+This creates your installer.exe
