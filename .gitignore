@@ -12,4 +12,8 @@ dist
 build
 installer 
 pyinstall
+<<<<<<< Updated upstream
 *.exe
+=======
+*.exe
+>>>>>>> Stashed changes

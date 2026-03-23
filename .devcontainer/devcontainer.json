@@ -8,7 +8,8 @@
 		"--gpus=all"
 	],
 	"mounts": [
-		"type=bind,source=/tmp/.X11-unix,target=/tmp/.X11-unix"
+		"type=bind,source=/tmp/.X11-unix,target=/tmp/.X11-unix",
+		"type=bind,source=/media/aviary-nas/tina/Roundel/Roundel-Clinical/models,target=/workspaces/Roundel-Clinical/models"
 	],
 	"containerEnv": {
 		"DISPLAY": "${localEnv:DISPLAY}"
