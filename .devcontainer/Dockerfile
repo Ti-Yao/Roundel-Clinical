@@ -1,3 +1,25 @@
+# FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+# RUN apt-get update && apt-get install -y libopenexr-dev
+# RUN pip install pydicom h5py \
+# scikit-learn scikit-image matplotlib \
+#  nibabel numpy==1.26.4 \
+# typing_extensions --upgrade
+
+# RUN pip install --no-cache-dir \
+#     pydicom==2.2.2 \
+#     pylibjpeg==1.4.0 \
+#     pylibjpeg-libjpeg==1.3.4 \
+#     pylibjpeg-openjpeg==1.3.2 \
+#     streamlit==1.40.1 \
+#     stqdm \
+#     opencv-python-headless \
+#     streamlit_drawable_canvas \
+#     "numpy<2.0"
+
+# RUN pip uninstall protobuf -y
+# RUN pip install protobuf==3.20.3
+
 FROM tensorflow/tensorflow:2.9.1-gpu
 
 RUN apt-get update && apt-get install -y libopenexr-dev
@@ -16,7 +38,14 @@ RUN pip install --no-cache-dir \
     streamlit==1.40.1 \
     stqdm \
     opencv-python-headless \
-    streamlit_drawable_canvas
+    streamlit_drawable_canvas \
+    monai
+
+RUN pip install --no-cache-dir \
+    torch==2.3.0 \
+    torchvision==0.18.0 \
+    torchaudio==2.3.0 \
+    --index-url https://download.pytorch.org/whl/cu121
 
 RUN pip uninstall protobuf -y
 RUN pip install protobuf==3.20.3

@@ -12,7 +12,7 @@ st.write('# Roundel')
 
 view = st.segmented_control(
     "Tab",
-    options=["Segmentation ⭕","EDV/ESV Finder 🔍", "Mask Editor 📝", "Final Result ✅"],
+    options=["Segmentation ⭕", "Preview Segmentation 👁️", "Corrector Model 🔧", "EDV/ESV Finder 🔍", "EDV/ESV Mask Editor 📝", "Final Result ✅"],
     default = "Segmentation ⭕",
     label_visibility='hidden'
 )
@@ -26,7 +26,21 @@ if view == "Segmentation ⭕":
 
 
 # --------------------------------------------------------------
-# EDV/ESV Finder 
+# Preview Segmentation
+# --------------------------------------------------------------
+if view == "Preview Segmentation 👁️":
+    preview_segmentation_view()
+
+
+# --------------------------------------------------------------
+# Corrector Model
+# --------------------------------------------------------------
+if view == "Corrector Model 🔧":
+    corrector_model_view()
+
+
+# --------------------------------------------------------------
+# EDV/ESV Finder
 # --------------------------------------------------------------
 if view == "EDV/ESV Finder 🔍":
     edv_esv_view()
@@ -36,7 +50,7 @@ if view == "EDV/ESV Finder 🔍":
 # Mask Editor 
 # --------------------------------------------------------------
 
-if view == "Mask Editor 📝":
+if view == "EDV/ESV Mask Editor 📝":
     mask_editor_view()
 
 

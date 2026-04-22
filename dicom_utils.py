@@ -205,7 +205,12 @@ def save_mask_as_dicom_series(masks, save_path):
             dcm.SeriesInstanceUID = series_uid
             dcm.SOPInstanceUID = pydicom.uid.generate_uid()
 
-            dcm.save_as(f'{save_path}/slice_{slice_num:02}_time_{time_num:02}.dcm')
+            try:
+                dcm.save_as(f'{save_path}/slice_{slice_num:02}_time_{time_num:02}.dcm')
+            except Exception as e:
+                dcm.file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+                dcm['PixelData'].is_undefined_length = False
+                dcm.save_as(f'{save_path}/slice_{slice_num:02}_time_{time_num:02}.dcm')
 
 
 def extract_dicom_from_zip(zip_file):
@@ -215,8 +220,18 @@ def extract_dicom_from_zip(zip_file):
     zip_file.seek(0)
     with zipfile.ZipFile(zip_file, "r") as zip_ref:
         for name in zip_ref.namelist():
-            if name.lower().endswith(".dcm"):
-                with zip_ref.open(name) as f:
-                    ds = pydicom.dcmread(io.BytesIO(f.read()))
-                    dcms.append(ds)
+            if name.endswith("/") or name.startswith("__MACOSX"):
+                continue
+            basename = os.path.basename(name)
+            if basename.startswith("."):
+                continue
+            with zip_ref.open(name) as f:
+                data = f.read()
+            try:
+                ds = pydicom.dcmread(io.BytesIO(data), force=True)
+                if not hasattr(ds, "PixelData"):
+                    continue
+                dcms.append(ds)
+            except Exception:
+                continue
     return dcms

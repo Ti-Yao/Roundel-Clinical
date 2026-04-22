@@ -3,6 +3,10 @@
 data/
 results
 data/major_revisions
+image_with_prior_masks_plots
+True_vs_Prior_vs_Predicted_Mask_gifs
+models/
+cache/
 *csv
 *gif
 *png
@@ -12,8 +16,4 @@ dist
 build
 installer 
 pyinstall
-<<<<<<< Updated upstream
 *.exe
-=======
-*.exe
->>>>>>> Stashed changes

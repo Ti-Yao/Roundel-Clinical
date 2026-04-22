@@ -313,7 +313,7 @@ def find_crop_box(mask, crop_factor):
         return [x_min, y_min, x_max, y_max]
 
 
-def make_video(image, mask, save_file, ventricle = 'all', mask_frames = 'all',scale=1):
+def make_video(image, mask, save_file, ventricle = 'all', mask_frames = 'all', scale=1):
     N = st.session_state['N']
     if ventricle == 'rv':
         channels = [rv_idx, rv_myo_idx]
@@ -489,12 +489,18 @@ def copy_frames_channels(mask_name, dia_idx, sys_idx, blood_idx, myo_idx):
     channels = [blood_idx, myo_idx]
 
     mask = st.session_state[mask_name]
-    smooth_mask = st.session_state.preprocessed["smooth_mask"]
+    if st.session_state.get('corrector_mask_edited'):
+        source_mask = st.session_state['corrected_prior_mask']
+        print("[DEBUG] Using corrected prior mask as source for final result.")
+        print(f"[DEBUG] source_mask shape: {source_mask.shape}, mask shape: {mask.shape}")
+    else:
+        source_mask = st.session_state.preprocessed["smooth_mask"]
+        print("[DEBUG] Using intial segmentation mask as source for final result.")
+        print(f"[DEBUG] source_mask shape: {source_mask.shape}, mask shape: {mask.shape}")
 
-    # Loop over frames and channels to ensure proper assignment
     for f in frames:
         for c in channels:
-            mask[:, :, :, f, c] = smooth_mask[:, :, :, f, c]
+            mask[:, :, :, f, c] = source_mask[:, :, :, f, c]
 
 def confirm_selection(lv_dia_idx, lv_sys_idx,rv_dia_idx, rv_sys_idx):
     """Store confirmed EDV/ESV indices in session state."""
@@ -557,3 +563,154 @@ def resize_to_original(edited_mask, raw_mask, crop_box, dia_idx, sys_idx, ventri
     final_mask_2d = np.argmax(final_mask_2d, axis=-1)
     print(np.unique(final_mask_2d))
     return final_mask_2d
+
+
+def make_true_vs_prior_vs_pred_mask_3d_gif(image, true_mask, prior_mask, pred_mask, gif_name = 'example_prediction', prior_image=None):
+    ''' 
+    Creates a side-by-side gif of the true vs prior vs predicted masks for a given image, with an overlay of the true, prior and predicted masks on the original image. 
+    The function takes in the original image, the true mask, the prior mask, the predicted mask, a name for the gif, and optionally clinical data for the patient and a wandb run object to upload the gif. 
+    The function checks the shape of the input image and transposes it if necessary to ensure it is in the format [z,y,x]. 
+    It then creates a custom color map for the masks, extracts clinical data if provided, and creates a figure with two subplots for the true and predicted mask overlays. 
+    It iterates through each slice of the image, creates the overlays, and appends them to a list of frames. 
+    Finally, it creates an animation from the frames, saves it as a gif, uploads it to WandB if a run object is provided, and closes the plot to free memory.
+    '''
+    # print(f"image shape on entering gif code: {image.shape}")
+    # Check if image_shape is in shape [z,y,x], and if not, change to this format
+    if (image.shape[0] < image.shape[1]) & (image.shape[0] < image.shape[2]): # should be less slices than pixels in either x or y dimensions
+            image = image
+            true_mask = true_mask
+            prior_mask = prior_mask
+            pred_mask = pred_mask
+            if prior_image is not None:
+                prior_image = prior_image
+    else:
+            image = np.transpose(image, (2, 0, 1))
+            true_mask = np.transpose(true_mask, (2, 0, 1))
+            prior_mask = np.transpose(prior_mask, (2, 0, 1))
+            pred_mask = np.transpose(pred_mask, (2, 0, 1))
+            if prior_image is not None:
+                prior_image = np.transpose(prior_image, (2, 0, 1))
+
+    # print(f"image shape after transpose: {image.shape}")
+    
+    # Define the custom color map
+    colour_map = {
+        0: "black", # background
+        1: "red", # left ventricle
+        2: "blue", # right ventricle
+        3: "green", # lv myocardium
+        4: "yellow", # left atrium
+        5: "purple", # right atrium
+        6: "orange", # aorta
+        7: "pink", # pulmonary artery
+        8: "brown", # svc
+        9: "cyan" # ivc
+    }
+    # Create a ListedColormap using the values from the dictionary
+    custom_cmap = ListedColormap([colour_map[key] for key in sorted(colour_map.keys())])
+
+    # Create figure and subplots
+    fig, axes = plt.subplots(1, 3, figsize=(15, 10))
+    ax1, ax2, ax3 = axes  # Unpack the axes for easier referencing
+
+    frames = []
+    slice_position = image.shape[0]
+
+    for pos in range(slice_position):
+        # True mask overlay
+        p1 = ax1.imshow(image[pos, :, :], cmap='gray', vmin=np.min(image), vmax=np.max(image))
+        p2 = ax1.imshow(true_mask[pos, :, :], alpha=0.2, cmap=custom_cmap, 
+                        vmin=0, vmax=len(colour_map) - 1, interpolation='none')
+        ax1.set_title(f"{gif_name}\nTrue Mask Overlay")
+        ax1.axis('off')
+
+        # Prior mask overlay
+        if prior_image is None:
+            p3 = ax2.imshow(image[pos, :, :], cmap='gray', vmin=np.min(image), vmax=np.max(image))
+            p4 = ax2.imshow(prior_mask[pos, :, :], alpha=0.2, cmap=custom_cmap, 
+                            vmin=0, vmax=len(colour_map) - 1, interpolation='none')
+            ax2.set_title(f"{gif_name}\nPrior Mask Overlay")
+            ax2.axis('off')
+        elif prior_image is not None:
+            p3 = ax2.imshow(prior_image[pos, :, :], cmap='gray', vmin=np.min(prior_image), vmax=np.max(prior_image))
+            p4 = ax2.imshow(prior_mask[pos, :, :], alpha=0.2, cmap=custom_cmap, 
+                            vmin=0, vmax=len(colour_map) - 1, interpolation='none')
+            ax2.set_title(f"{gif_name}\nPrior Mask Overlay")
+            ax2.axis('off')
+
+        # Predicted mask overlay
+        p5 = ax3.imshow(image[pos, :, :], cmap='gray', vmin=np.min(image), vmax=np.max(image))
+        p6 = ax3.imshow(pred_mask[pos, :, :], alpha=0.2, cmap=custom_cmap, 
+                        vmin=0, vmax=len(colour_map) - 1, interpolation='none')
+        ax3.set_title(f"{gif_name}\nPredicted Mask Overlay")
+        ax3.axis('off')
+
+    
+        # Append the frames for animation
+        frames.append([p1, p2, p3, p4, p5, p6])
+
+    # Check there are the correct number of frames
+    if len(frames) != slice_position:
+        raise ValueError("Number of frames is not equal to the number of slices in the image")
+
+    # Create and upload animation to neptune
+    output_dir = "True_vs_Prior_vs_Predicted_Mask_gifs"
+    os.makedirs(output_dir, exist_ok=True)  # Create directory if it doesn't exist
+    gif_path = os.path.join(output_dir, f"{gif_name}.gif")  # Save in the directory with a unique name
+    ani = animation.ArtistAnimation(fig, frames, interval=200, blit=True)
+    ani.save(gif_path, fps=3)
+
+    plt.close()  # Close the plot to free memory
+
+def plot_image_with_prior_masks(image, gif_name='example_prediction'):
+    """Plots a 2d slice of a 3D image with its corresponding prior masks side by side, and an overlay of
+    the masks on both the target image (channel 0) and the prior image (channel 1). Saves the plot to disk."""
+    # image is (H, W, D, C) where channel 0 = target image, channel 1 = prior image, channels 2+ = prior mask classes
+    num_prior_masks = image.shape[3] - 2  # subtract target and prior image channels
+    # columns: target image, prior image, each mask channel, overlay on target, overlay on prior
+    n_cols = num_prior_masks + 4
+    fig, axes = plt.subplots(1, n_cols, figsize=(20 * n_cols, 20))
+
+    mid_slice = image.shape[2] // 2
+    colors = plt.cm.tab10.colors  # up to 10 distinct colours
+
+    # Target image
+    axes[0].imshow(image[:, :, mid_slice, 0], cmap='gray')
+    axes[0].set_title('Target Image')
+    axes[0].axis('off')
+
+    # Prior image
+    axes[1].imshow(image[:, :, mid_slice, 1], cmap='gray')
+    axes[1].set_title('Prior Image')
+    axes[1].axis('off')
+
+    # Prior mask channels (one per column)
+    for m in range(num_prior_masks):
+        axes[2 + m].imshow(image[:, :, mid_slice, 2 + m], cmap='gray')
+        axes[2 + m].set_title(f'Prior Mask {m + 1}')
+        axes[2 + m].axis('off')
+
+    def _draw_overlay(ax, bg_channel, title):
+        ax.imshow(image[:, :, mid_slice, bg_channel], cmap='gray')
+        for m in range(num_prior_masks):
+            mask = image[:, :, mid_slice, 2 + m]
+            color = colors[m % len(colors)]
+            colored = np.zeros((*mask.shape, 4))  # RGBA
+            colored[..., :3] = color[:3]
+            colored[..., 3] = mask * 0.5  # alpha proportional to mask intensity
+            ax.imshow(colored)
+        ax.set_title(title)
+        ax.axis('off')
+
+    # Overlay on target image
+    _draw_overlay(axes[-2], bg_channel=0, title='Target + Prior Masks')
+    # Overlay on prior image
+    _draw_overlay(axes[-1], bg_channel=1, title='Prior + Prior Masks')
+
+    output_dir = "image_with_prior_masks_plots"
+    # create output dir if doesnt exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    plt.suptitle(gif_name)
+    plt.savefig(f"{output_dir}/{gif_name}.png")
+    plt.close()

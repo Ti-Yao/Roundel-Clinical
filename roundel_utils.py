@@ -1,7 +1,12 @@
 from utils import *
+import traceback
+import torch
+from UNet import UNet
+from sliding_window_inference import monai_sliding_window_inference_3d
 
-st.session_state['N'] = 5
+
 def segmentation_view():
+    st.session_state['N'] = 5
     st.header("Data Upload")
 
     if 'disable_upload' not in st.session_state:
@@ -23,9 +28,9 @@ def segmentation_view():
                 st.session_state['sax_df'] = sax_df
                 first_dcm = sax_df['dcm'].values[0]
 
-                st.session_state.patient_name = str(first_dcm.PatientName)
-                st.session_state.series_date = str(first_dcm.SeriesDate)
-                st.session_state.series_description = str(first_dcm.SeriesDescription)
+                st.session_state.patient_name = str(first_dcm.PatientName) if hasattr(first_dcm, 'PatientName') and first_dcm.PatientName else 'Anonymised Patient'
+                st.session_state.series_date = str(first_dcm.SeriesDate) if hasattr(first_dcm, 'SeriesDate') and first_dcm.SeriesDate else 'Unknown'
+                st.session_state.series_description = str(first_dcm.SeriesDescription) if hasattr(first_dcm, 'SeriesDescription') and first_dcm.SeriesDescription else 'Unknown'
                 st.session_state.pixelspacing = sax_df.pixelspacing.unique()[0]
                 st.session_state.thickness = sax_df.thickness.unique()[0]
                 st.session_state['sax_series_uid'] = first_dcm.SeriesInstanceUID
@@ -80,42 +85,88 @@ def segmentation_view():
 
 
 def segment_image(image):
-    # Crop and pad the image to correct shape
 
-    st.session_state['model'] = tf.keras.models.load_model(f'{models_path}/SAX-37.h5', 
-                                    compile = False,
-                                    custom_objects={"InstanceNormalization":InstanceNormalization,
-                                                    "ResizeAndConcatenate":ResizeAndConcatenate})
+    if torch.cuda.is_available():
+        try:
+            torch.zeros(1).cuda()
+            device = torch.device('cuda')
+        except RuntimeError as e:
+            print(f"[DEBUG] CUDA unavailable ({e}), falling back to CPU")
+            device = torch.device('cpu')
+    else:
+        device = torch.device('cpu')
+    print(f"[DEBUG] device: {device}")
 
-    target_shape = (256,256)
-    mask = []
-    for t in stqdm(range(image.shape[-1])):  
-        image_cropped, meta =  crop_pad_image_only(image[..., t], target_shape = target_shape)
-        X = z_normalise_image(image_cropped)[np.newaxis,...,np.newaxis]
-        pred_mask = sliding_window_inference_3d(
-                        st.session_state.model,
-                        X,                   # np.ndarray [batch_size,Y,X,Z,1] already preprocessed & normalised
-                        patch_size=[256,256,10],
-                        overlap=0.5,
-                        apply_softmax=False,       # set False as the model already uses softmax activation
-                        out_channels=5,    # if known, can be set to avoid dry run
-                        tta=False,                 # Whether to use test-time augmentation (flips)
-                        plot_tta=False,           # Whether to plot the prediction after each TTA variant (for debugging)
-                        scan_id = None,           # used for naming the TTA variant plots
-                        time_step_counter=0, # used for naming the TTA variant plots
-                        gaussian_sigma_scale=1/8, # controls how peaked the Gaussian is
-                        deep_supervision=True,
-                        run = None               # neptune run instance for logging
-                    )
-        pred_mask = reverse_crop_pad(pred_mask, meta)
+    try:
+      if 'model' not in st.session_state:
+        print("[DEBUG] Loading UNet model...")
+        model = UNet(
+            in_channels=1, out_channels=5,
+            filters=[32, 64, 128, 256, 320, 320, 320],
+            kernel_sizes=[(1,3,3),(1,3,3),(3,3,3),(3,3,3),(3,3,3),(3,3,3),(3,3,3)],
+            strides=[(1,1,1),(1,2,2),(1,2,2),(2,2,2),(1,2,2),(1,2,2),(1,2,2)],
+            conv_blocks_per_level=2, 
+            rank=3,
+            activation='leaky_relu',
+            norm_type='InstanceNorm',
+            final_activation='softmax',
+            deep_supervision=True,
+            num_ds_outputs=4,
+        )
+        state = torch.load(f'{models_path}/initial_unet_model.pth', map_location=device)
+        model.load_state_dict(state)
+        st.session_state['model'] = model.eval().to(device)
+        print("[DEBUG] Model loaded successfully.")
 
-        mask.append(pred_mask)
-    mask = np.stack(mask, -1)
-    mask = postprocess(mask)
-    save_image(image, save_path=f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
-    save_mask(mask, save_path=f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz')
+      model = st.session_state['model']
+      native_spacing = st.session_state.pixelspacing
+      mask = []
+      print(f"[DEBUG] Starting inference over {image.shape[-1]} timesteps, native_spacing={native_spacing}")
 
+      for t in stqdm(range(image.shape[-1])):
+        image_t = image[..., t].astype(np.float32)
+        image_resampled = resample_volume(image_t, native_spacing)
+        image_cropped, meta = crop_pad_image_only(image_resampled)
+        image_norm = z_normalise_image(image_cropped.copy())
+        X = image_norm.transpose(2, 0, 1)[np.newaxis, np.newaxis, ...].astype(np.float32)
+        if t == 0:
+            print(f"[DEBUG] t=0: native={image_t.shape}, resampled={image_resampled.shape}, cropped={image_cropped.shape}, X={X.shape}")
+        prob_map, _ = monai_sliding_window_inference_3d(
+            model, X,
+            patch_size=(256, 256, 10),
+            overlap=0.5,
+            apply_softmax=False,
+            out_channels=5,
+            tta=False,
+            deep_supervision=True,
+        )
+        if t == 0:
+            print(f"[DEBUG] t=0: prob_map shape={prob_map.shape}")
+            pred_mask = np.argmax(prob_map, axis=-1).astype(np.uint8)
+            print(f"[DEBUG] t=0: pred_mask shape after argmax={pred_mask.shape}")
+            pred_mask = reverse_crop_pad(pred_mask, meta)
+            print(f"[DEBUG] t=0: pred_mask shape after reverse crop/pad={pred_mask.shape}")
+            pred_mask = resample_mask(pred_mask, native_spacing)
+            print(f"[DEBUG] t=0: pred_mask shape after resample={pred_mask.shape}")
+            mask.append(pred_mask)
+        else:
+            pred_mask = np.argmax(prob_map, axis=-1).astype(np.uint8)
+            pred_mask = reverse_crop_pad(pred_mask, meta)
+            pred_mask = resample_mask(pred_mask, native_spacing)
+            mask.append(pred_mask)
 
+      mask = np.stack(mask, axis=-1)
+      mask = postprocess(mask)
+      save_image(image, save_path=f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
+      save_mask(mask, save_path=f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz')
+      print("[DEBUG] segment_image() finished successfully.")
+      return True
+    except Exception as e:
+        print(f"[DEBUG] EXCEPTION in segment_image: {e}")
+        traceback.print_exc()
+        return False
+    
+    
 # --------------------------------------------------------------
 # Initialization
 # --------------------------------------------------------------
@@ -210,6 +261,11 @@ def initialize_app():
         make_video(smoothed_image, smoothed_mask*0, save_file=blank_gif_path)
         pbar.update(1)
 
+        preview_gif_path = f'{results_path}/temp/preview'
+        make_video(smoothed_image, smoothed_mask, save_file=preview_gif_path)
+        st.session_state['preview_gif_path'] = f'{preview_gif_path}.gif'
+        pbar.update(1)
+
 
         gif = Image.open(f'{edv_esv_gif_path}.gif')
 
@@ -251,6 +307,342 @@ def initialize_app():
         st.session_state.initialized_all = True
 
 
+
+def preview_segmentation_view():
+    if not st.session_state.get('initialized_all'):
+        st.info("Run segmentation first to preview the result.")
+        return
+
+    st.header("Preview Segmentation")
+    _, col2, _ = st.columns([1, 2, 1])
+    with col2:
+        st.image(st.session_state['preview_gif_path'], use_container_width=True)
+        message_col1, message_col2 = st.columns(2)
+        with message_col1:
+            st.markdown(
+                "<div style='background-color: rgba(255, 165, 0, 0.25); "
+                "padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(255, 165, 0, 0.6);'>"
+                "⚠️ 4D Segmentation Incorrect<br>Proceed to Corrector Model</div>",
+                unsafe_allow_html=True,
+            )
+        with message_col2:
+            st.markdown(
+                "<div style='background-color: rgba(76, 175, 80, 0.25); "
+                "padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(76, 175, 80, 0.6);'>"
+                "✅ 4D Segmentation Satisfactory<br>Proceed to EDV/ESV Finder</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def corrector_model_view():
+    st.header("Choose a frame, correct SAX segmentation and then run the Corrector Model")
+    if not st.session_state.get('initialized_all'):
+        st.info("Run segmentation first.")
+        return
+
+    if 'corrected_prior_mask' not in st.session_state:
+        st.session_state['corrected_prior_mask'] = st.session_state.preprocessed["smooth_mask"].copy()
+
+    col1, col2, col3 = st.columns([1, 1.5, 1.5])
+
+    H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H", "W", "D", "T", "N"]]
+    image = st.session_state.preprocessed["smooth_image"]
+
+    with col1:
+        channel, action, stroke_width = select_brush(N, 'all')
+
+        st.caption('Image Selection')
+        idx = st.slider("Frame Index", 0, T - 1, value=0, key="corrector_frame_idx")
+        d, _ = slice_navigation(D)
+
+        if st.button("Confirm SAX correction. Run Corrector Model", use_container_width=True, type='primary'):
+            raw_image = st.session_state.raw["image"]
+            x_min, y_min, x_max, y_max = st.session_state.preprocessed["crop_box"]
+            subpixel_res = st.session_state['subpixel_resolution']
+            zoom_down = 1.0 / subpixel_res
+            N = st.session_state['N']
+
+            prior_image = raw_image[:, :, :, idx]
+
+            # Downsample prior mask from smooth coords to crop coords, then pad to raw dims
+            prior_mask_smooth = st.session_state['corrected_prior_mask'][:, :, :, idx, :]
+            prior_mask_crop = cv_zoom(
+                prior_mask_smooth.astype(np.float32),
+                zoom=[zoom_down, zoom_down, 1, 1],
+                interpolation=cv2.INTER_NEAREST
+            )
+            prior_mask_crop = (prior_mask_crop > 0.5).astype(np.uint8)
+
+            H_raw, W_raw, D_raw = raw_image.shape[:3]
+            prior_mask_raw = np.zeros((H_raw, W_raw, D_raw, N), dtype=np.uint8)
+            prior_mask_raw[y_min:y_max, x_min:x_max, :, :] = prior_mask_crop
+
+            with st.spinner("Running Corrector Model..."):
+                success = run_corrector_unet(raw_image, prior_image, prior_mask_raw)
+
+            if success:
+                new_mask_raw = load_nii(
+                    f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz'
+                ).astype('uint8')
+                new_mask_onehot = np.eye(N, dtype=np.uint8)[new_mask_raw]
+                new_mask_crop = new_mask_onehot[y_min:y_max, x_min:x_max, :, :, :]
+                new_mask_smooth = cv_zoom_mask(
+                    new_mask_crop,
+                    zoom=[subpixel_res, subpixel_res, 1, 1]
+                )
+                st.session_state['corrected_prior_mask'] = new_mask_smooth
+                st.session_state['corrector_edit_made'] = True
+                st.session_state['corrector_mask_edited'] = True
+                st.rerun()
+            else:
+                st.error("Corrector Model failed. Check logs for details.")
+
+    image_slice = image[:, :, d, idx]
+    image_slice = (normalize(image_slice) * 255).astype(np.uint8)
+    mask_slice = st.session_state['corrected_prior_mask'][:, :, d, idx, :]
+
+    with col2:
+        edit_mode = st.radio('Segmentation Editor', ['Editor', 'Viewer'], index=0, horizontal=True)
+        stroke_color = f"rgba{OVERLAY_COLORS[background_idx][:3]+(0.7,)}" if action == "Erase ✂️" else f"rgba{OVERLAY_COLORS[channel][:3]+(0.65,)}"
+        if edit_mode == 'Viewer':
+            st.image(image_slice, width=DISPLAY_W)
+        else:
+            if 'corrector_canvas' not in st.session_state:
+                st.session_state['corrector_canvas'] = {
+                    'canvas_key': f'corrector_{d}_{idx}',
+                    'previous_d': d,
+                    'previous_idx': idx,
+                    'previous_objects': []
+                }
+
+            prev_d = st.session_state['corrector_canvas']['previous_d']
+            prev_idx = st.session_state['corrector_canvas']['previous_idx']
+            if (prev_d != d or prev_idx != idx) and st.session_state['corrector_canvas']['previous_objects']:
+                st.session_state['corrector_canvas']['canvas_key'] = f'corrector_{d}_{idx}'
+                st.session_state['corrector_canvas']['previous_objects'] = []
+
+            st.session_state['corrector_canvas']['previous_d'] = d
+            st.session_state['corrector_canvas']['previous_idx'] = idx
+
+            canvas_result = st_canvas(
+                stroke_width=stroke_width,
+                stroke_color=stroke_color,
+                background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS, 'all'),
+                update_streamlit=True,
+                height=H * DISPLAY_W / W,
+                width=DISPLAY_W,
+                drawing_mode='freedraw',
+                key=st.session_state['corrector_canvas']['canvas_key'] + '_corrector'
+            )
+
+            current_objects = []
+            if canvas_result and canvas_result.json_data:
+                current_objects = canvas_result.json_data.get("objects", [])
+            st.session_state['corrector_canvas']['previous_objects'] = current_objects
+
+            col_save, col_clear = st.columns([1, 0.3])
+
+            with col_save:
+                save_contour = st.button('Save Contour', type='primary', use_container_width=True)
+                if save_contour and canvas_result and canvas_result.image_data is not None and current_objects:
+                    brush_data = np.array(canvas_result.image_data)
+                    rgb = brush_data[:, :, :3].astype(np.float32)
+                    alpha = brush_data[:, :, 3].astype(np.float32) / 255.0
+
+                    overlay_colors_list = np.array([color[:3] for color in OVERLAY_COLORS.values()], dtype=np.float32)
+                    overlay_channels = list(OVERLAY_COLORS.keys())
+
+                    h, w, _ = rgb.shape
+                    rgb_flat = rgb.reshape(-1, 3)
+                    alpha_flat = alpha.flatten()
+                    distances = np.linalg.norm(rgb_flat[:, None, :] - overlay_colors_list[None, :, :], axis=-1)
+                    closest_idx = np.argmin(distances, axis=1)
+
+                    mask_flat = np.zeros((h * w, len(overlay_channels)), dtype=np.uint8)
+                    for idx_color, ch in enumerate(overlay_channels):
+                        mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(np.uint8)
+
+                    painted_masks = []
+                    for idx_color, ch in enumerate(overlay_channels):
+                        mask_bool = mask_flat[:, idx_color].reshape(h, w)
+                        mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
+                        painted_masks.append(mask_bool)
+
+                    painted_stack = np.stack(painted_masks, axis=-1)
+                    corrected_prior_mask = st.session_state['corrected_prior_mask']
+                    for idx_color, ch in enumerate(overlay_channels):
+                        resized_mask = np.array(
+                            Image.fromarray(painted_stack[:, :, idx_color]).resize(
+                                (W * st.session_state['subpixel_resolution'], H * st.session_state['subpixel_resolution']),
+                                resample=Image.NEAREST
+                            )
+                        )
+                        if not np.any(resized_mask > 0):
+                            continue
+                        corrected_prior_mask[:, :, d, idx, :][resized_mask > 0] = 0
+                        corrected_prior_mask[:, :, d, idx, ch][resized_mask > 0] = 1
+
+                    st.session_state['corrected_prior_mask'] = corrected_prior_mask
+                    st.session_state['corrector_edit_made'] = True
+                    st.session_state['corrector_mask_edited'] = True
+                    st.rerun()
+
+            with col_clear:
+                if st.button('❌', use_container_width=True):
+                    st.session_state['corrected_prior_mask'][:, :, d, idx, :] = 0
+                    st.session_state['corrector_edit_made'] = True
+                    st.rerun()
+
+    with col3:
+        st.radio("Corrected Mask", ["Static"], index=0, horizontal=True, disabled=True)
+
+        if st.session_state.get('corrector_frames') is None or st.session_state.get('corrector_edit_made'):
+            make_video(
+                image,
+                st.session_state['corrected_prior_mask'],
+                save_file=f'{edited_gif_path}_corrector',
+                mask_frames='all',
+                ventricle='all'
+            )
+            gif = Image.open(f'{edited_gif_path}_corrector.gif')
+            st.session_state['corrector_frames'] = [frame.copy() for frame in ImageSequence.Iterator(gif)]
+            st.session_state['corrector_edit_made'] = False
+
+        corrector_frames = st.session_state['corrector_frames']
+        st.image(corrector_frames[idx % len(corrector_frames)], width=int(DISPLAY_W * 1.5))
+
+
+
+def run_corrector_unet(image, prior_image, prior_mask):
+
+    print(f"[DEBUG-Corrector] image shape={image.shape}, prior_image shape={prior_image.shape}, prior_mask shape={prior_mask.shape}")
+    prior_mask = np.argmax(prior_mask, axis=-1).astype(np.uint8)
+    
+    # Save a gif of the images for review 
+    # true_mask = np.zeros_like(prior_mask)  # Placeholder for true mask since we don't have it in the corrector stage
+    # make_true_vs_prior_vs_pred_mask_3d_gif(image[...,6], true_mask, prior_mask, prior_mask, gif_name = 'example_prediction', prior_image=prior_image)
+
+    if torch.cuda.is_available():
+        try:
+            torch.zeros(1).cuda()
+            device = torch.device('cuda')
+        except RuntimeError as e:
+            print(f"[DEBUG-Corrector] CUDA unavailable ({e}), falling back to CPU")
+            device = torch.device('cpu')
+    else:
+        device = torch.device('cpu')
+    print(f"[DEBUG-Corrector] device: {device}")
+
+    try:
+      if 'corrector_model' not in st.session_state:
+        print("[DEBUG-Corrector] Loading UNet model...")
+        corrector_model = UNet(
+            in_channels=6, out_channels=5,
+            filters=[32, 64, 128, 256, 320, 320, 320],
+            kernel_sizes=[(1,3,3),(1,3,3),(3,3,3),(3,3,3),(3,3,3),(3,3,3),(3,3,3)],
+            strides=[(1,1,1),(1,2,2),(1,2,2),(2,2,2),(1,2,2),(1,2,2),(1,2,2)],
+            conv_blocks_per_level=2, 
+            rank=3,
+            activation='leaky_relu',
+            norm_type='InstanceNorm',
+            final_activation='softmax',
+            deep_supervision=True,
+            num_ds_outputs=4,
+        )
+        corrector_state = torch.load(f'{models_path}/corrector_unet_model.pth', map_location=device)
+        corrector_model.load_state_dict(corrector_state)
+        st.session_state['corrector_model'] = corrector_model.eval().to(device)
+        print("[DEBUG-Corrector] Model loaded successfully.")
+
+      corrector_model = st.session_state['corrector_model']
+      native_spacing = st.session_state.pixelspacing
+      mask = []
+      print(f"[DEBUG-Corrector] Starting inference over {image.shape[-1]} timesteps, native_spacing={native_spacing}")
+
+      for t in stqdm(range(image.shape[-1])):
+        # Process each time step independently through the corrector model, using the prior image and the prior mask as additional channels
+        image_t = image[..., t].astype(np.float32)
+        image_resampled = resample_volume(image_t, native_spacing)
+        image_cropped, meta = crop_pad_image_only(image_resampled)
+        image_norm = z_normalise_image(image_cropped.copy())
+        # Stack the prior image and prior mask with the current image as additional channels
+        image_prior_resampled = resample_volume(prior_image, native_spacing)
+        image_prior_cropped, _ = crop_pad_image_only(image_prior_resampled)
+        image_prior_norm = z_normalise_image(image_prior_cropped.copy())
+
+        plt.imshow(image_t[:,:,6], cmap='gray')
+        plt.imshow(prior_mask[:,:,6], cmap='jet', alpha=0.2)
+        plt.title('Prior Mask (original)')
+        plt.savefig('/workspaces/Roundel-Clinical/image_with_prior_masks_plots/debug_prior_mask_original.png')
+        plt.close()
+
+        print(f"[DEBUG-Corrector]. prior_mask shape before resampling: {prior_mask.shape}, unique values: {np.unique(prior_mask)}")
+        prior_mask_resampled = resample_prior_mask(prior_mask, native_spacing)
+        print(f"[DEBUG-Corrector]. prior_mask shape after resampling: {prior_mask_resampled.shape}, unique values: {np.unique(prior_mask_resampled)}")
+
+        plt.imshow(image_resampled[:,:,6], cmap='gray')
+        plt.imshow(prior_mask_resampled[:,:,6], cmap='jet', alpha=0.2)
+        plt.title('Prior Mask (resampled)')
+        plt.savefig('/workspaces/Roundel-Clinical/image_with_prior_masks_plots/debug_prior_mask_resampled.png')
+        plt.close() 
+
+        prior_mask_cropped, _ = crop_pad_image_only(prior_mask_resampled)
+        print(f"[DEBUG-Corrector]. prior_mask shape after cropping: {prior_mask_cropped.shape}, unique values: {np.unique(prior_mask_cropped)}")
+
+        plt.imshow(image_cropped[:,:,6], cmap='gray')
+        plt.imshow(prior_mask_cropped[:,:,6], cmap='jet', alpha=0.2)
+        plt.title('Prior Mask (cropped)')
+        plt.savefig('/workspaces/Roundel-Clinical/image_with_prior_masks_plots/debug_prior_mask_cropped.png')
+        plt.close() 
+
+        print(f"[DEBUG-Corrector] t={t}: image_cropped shape={image_cropped.shape}, image_prior_cropped shape={image_prior_cropped.shape}, prior_mask_cropped shape={prior_mask_cropped.shape}")
+        ## Exapand mask to one-hot encoding
+        prior_mask_cropped = np.eye(st.session_state['N'], dtype=np.uint8)[prior_mask_cropped]
+        ## Remove background channel from prior mask before concatenation.
+        prior_mask_cropped = prior_mask_cropped[..., 1:]
+
+        image_input = np.concatenate([image_norm[..., np.newaxis], image_prior_norm[..., np.newaxis], prior_mask_cropped], axis=-1)
+        if t == 6:
+            plot_image_with_prior_masks(image_input, gif_name='example_prediction')
+
+        X = image_input.transpose(3, 2, 0, 1)[np.newaxis, ...].astype(np.float32)
+        if t == 0:
+            print(f"[DEBUG-Corrector] t=0: native={image_t.shape}, resampled={image_resampled.shape}, cropped={image_cropped.shape}, X={X.shape}")
+            print(f"[DEBUG-Corrector] t=0: min/max of each channel in X: {[ (X[0, c].min(), X[0, c].max()) for c in range(X.shape[1]) ]}")
+        prob_map, _ = monai_sliding_window_inference_3d(
+            corrector_model, X,
+            patch_size=(256, 256, 10),
+            overlap=0.5,
+            apply_softmax=False,
+            out_channels=5,
+            tta=True,
+            deep_supervision=True,
+        )
+        if t == 0:
+            print(f"[DEBUG-Corrector] t=0: prob_map shape={prob_map.shape}")
+            pred_mask = np.argmax(prob_map, axis=-1).astype(np.uint8)
+            print(f"[DEBUG-Corrector] t=0: pred_mask shape after argmax={pred_mask.shape}")
+            pred_mask = reverse_crop_pad(pred_mask, meta)
+            print(f"[DEBUG-Corrector] t=0: pred_mask shape after reverse crop/pad={pred_mask.shape}")
+            pred_mask = resample_mask(pred_mask, native_spacing)
+            print(f"[DEBUG-Corrector] t=0: pred_mask shape after resample={pred_mask.shape}")
+            mask.append(pred_mask)
+        else:
+            pred_mask = np.argmax(prob_map, axis=-1).astype(np.uint8)
+            pred_mask = reverse_crop_pad(pred_mask, meta)
+            pred_mask = resample_mask(pred_mask, native_spacing)
+            mask.append(pred_mask)
+
+      mask = np.stack(mask, axis=-1)
+      mask = postprocess(mask)
+      save_image(image, save_path=f'{data_path}/image___{st.session_state.sax_series_uid}.nii.gz')
+      save_mask(mask, save_path=f'{data_path}/masks___{st.session_state.sax_series_uid}.nii.gz')
+      print("[DEBUG-Corrector] run_corrector_unet() finished successfully.")
+      return True
+    except Exception as e:
+        print(f"[DEBUG-Corrector] EXCEPTION in run_corrector_unet: {e}")
+        traceback.print_exc()
+        return False
 
 def edv_esv_view():
     """Full EDV/ESV Finder view layout."""
@@ -418,27 +810,24 @@ def mask_editor_view():
     col1, col2, col3 = st.columns([1,1.5,1.5])
 
     H, W, D, T, N = [st.session_state.preprocessed[k] for k in ["H","W","D","T","N"]]
-    image=st.session_state.preprocessed["smooth_image"]
+    image = st.session_state.preprocessed["smooth_image"]
 
     with col1:
-        ventricle_label = st.radio("Ventricle", options=["Left Ventricle","Right Ventricle"],  index = 0, horizontal=True)
-        ventricle = 'lv' if 'left' in ventricle_label.lower() else 'rv'
-        channel, action, stroke_width = select_brush(N, ventricle)
+        channel, action, stroke_width = select_brush(N, 'all')
 
         st.caption('Image Selection')
-        idx_label = st.radio("Frame", options=["End-Diastole","End-Systole"],  index = 0, horizontal=True)
+        lv_dia = st.session_state.edv_esv_selected["lv_dia_idx"]
+        lv_sys = st.session_state.edv_esv_selected["lv_sys_idx"]
+        rv_dia = st.session_state.edv_esv_selected["rv_dia_idx"]
+        rv_sys = st.session_state.edv_esv_selected["rv_sys_idx"]
+        st.caption(f"LV ED: {lv_dia} | LV ES: {lv_sys} | RV ED: {rv_dia} | RV ES: {rv_sys}")
+        idx = st.slider("Frame Index", 0, T - 1, value=lv_dia, key="frame_idx")
         d, reset_canvas = slice_navigation(D)
 
-
-        edited_mask=st.session_state[f'edited_mask_{ventricle}']
-        dia_idx=st.session_state.edv_esv_selected[f"{ventricle}_dia_idx"]
-        sys_idx=st.session_state.edv_esv_selected[f"{ventricle}_sys_idx"]
-
-
-    idx = dia_idx if idx_label=="End-Diastole" else sys_idx
+    combined_display_mask = merge_masks(st.session_state['edited_mask_lv'], st.session_state['edited_mask_rv'])
     image_slice = image[:,:,d,idx]
     image_slice = (normalize(image_slice) * 255).astype(np.uint8)
-    mask_slice = edited_mask[:,:,d,idx,:]
+    mask_slice = combined_display_mask[:,:,d,idx,:]
 
     with col2:
         edit_mode = st.radio('Segmentation Editor',['Editor','Viewer'], index=0, horizontal=True)
@@ -453,7 +842,7 @@ def mask_editor_view():
                     'previous_d': d,
                     'previous_objects': []
                 }
-                        
+
             if reset_canvas:
                 st.session_state['canvas']['canvas_key'] = f'editor_{d}'
                 st.session_state['canvas']['previous_objects'] = []
@@ -463,14 +852,13 @@ def mask_editor_view():
             canvas_result = st_canvas(
                 stroke_width=stroke_width,
                 stroke_color=stroke_color,
-                background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS, ventricle),
+                background_image=get_overlay(image_slice, mask_slice, H, W, N, OVERLAY_COLORS, 'all'),
                 update_streamlit=True,
-                height = H*DISPLAY_W/W,
+                height=H*DISPLAY_W/W,
                 width=DISPLAY_W,
                 drawing_mode='freedraw',
-                key=st.session_state['canvas']['canvas_key']+ ventricle
+                key=st.session_state['canvas']['canvas_key'] + '_all'
             )
-
 
             # Track current objects
             current_objects = []
@@ -480,8 +868,7 @@ def mask_editor_view():
 
             # Save / clear buttons (trigger rerun only here)
             col_save, col_clear = st.columns([1, 0.3])
-            edited_mask = st.session_state[f'edited_mask_{ventricle}']
-            
+
             with col_save:
                 save_contour = st.button('Save Contour', type='primary', use_container_width=True)
                 if save_contour and canvas_result and canvas_result.image_data is not None and current_objects:
@@ -502,40 +889,47 @@ def mask_editor_view():
                     for idx_color, ch in enumerate(overlay_channels):
                         mask_flat[:, idx_color] = ((closest_idx == idx_color) & (alpha_flat > 0)).astype(np.uint8)
 
-                    masks = []
+                    painted_masks = []
                     for idx_color, ch in enumerate(overlay_channels):
                         mask_bool = mask_flat[:, idx_color].reshape(h, w)
                         mask_bool = thicken_close_fill_and_smooth(mask_bool, stroke_width)
-                        masks.append(mask_bool)
+                        painted_masks.append(mask_bool)
 
-                    combined_mask = np.stack(masks, axis=-1)
+                    painted_stack = np.stack(painted_masks, axis=-1)
+                    lv_channels = (lv_idx, lv_myo_idx)
                     for idx_color, ch in enumerate(overlay_channels):
                         resized_mask = np.array(
-                            Image.fromarray(combined_mask[:, :, idx_color]).resize(
+                            Image.fromarray(painted_stack[:, :, idx_color]).resize(
                                 (W*st.session_state['subpixel_resolution'], H*st.session_state['subpixel_resolution']),
                                 resample=Image.NEAREST
                             )
                         )
-                        edited_mask[:, :, d, idx, :][resized_mask > 0] = 0
-                        edited_mask[:, :, d, idx, ch][resized_mask > 0] = 1
+                        if not np.any(resized_mask > 0):
+                            continue
+                        st.session_state['edited_mask_lv'][:, :, d, idx, :][resized_mask > 0] = 0
+                        st.session_state['edited_mask_rv'][:, :, d, idx, :][resized_mask > 0] = 0
+                        if ch in lv_channels:
+                            st.session_state['edited_mask_lv'][:, :, d, idx, ch][resized_mask > 0] = 1
+                        else:
+                            st.session_state['edited_mask_rv'][:, :, d, idx, ch][resized_mask > 0] = 1
 
                     st.session_state['edit_made'] = True
-                    combined_mask = merge_masks(st.session_state[f'edited_mask_lv'] , st.session_state[f'edited_mask_rv'])
-                    save_cached_mask(combined_mask, save_path=st.session_state['cache_mask_path'])
+                    save_cached_mask(
+                        merge_masks(st.session_state['edited_mask_lv'], st.session_state['edited_mask_rv']),
+                        save_path=st.session_state['cache_mask_path']
+                    )
                     st.rerun()
 
             with col_clear:
                 if st.button('❌', use_container_width=True):
-                    edited_mask[:, :, d, idx, :] = 0
-                    combined_mask = merge_masks(st.session_state[f'edited_mask_lv'] , st.session_state[f'edited_mask_rv'])
-                    save_cached_mask(combined_mask, save_path=st.session_state['cache_mask_path'])
-
+                    st.session_state['edited_mask_lv'][:, :, d, idx, :] = 0
+                    st.session_state['edited_mask_rv'][:, :, d, idx, :] = 0
+                    save_cached_mask(
+                        merge_masks(st.session_state['edited_mask_lv'], st.session_state['edited_mask_rv']),
+                        save_path=st.session_state['cache_mask_path']
+                    )
                     st.session_state['edit_made'] = True
                     st.rerun()
-
-            st.session_state[f'edited_mask_{ventricle}'] = edited_mask
-            
-
 
     # ---------- right column preview ----------
     with col3:
@@ -546,27 +940,27 @@ def mask_editor_view():
             horizontal=True,
         )
 
-        if st.session_state[f'{ventricle}_frames'] is None or st.session_state['edit_made']:
+        if st.session_state.get('all_frames') is None or st.session_state['edit_made']:
             make_video(
                 image,
-                st.session_state[f'edited_mask_{ventricle}'],
-                save_file=f'{edited_gif_path}_{ventricle}',
-                mask_frames = [dia_idx, sys_idx],
-                ventricle = ventricle
+                merge_masks(st.session_state['edited_mask_lv'], st.session_state['edited_mask_rv']),
+                save_file=f'{edited_gif_path}_all',
+                mask_frames='all',
+                ventricle='all'
             )
 
-            gif = Image.open(f'{edited_gif_path}_{ventricle}.gif')
-            st.session_state[f'{ventricle}_frames'] = [frame.copy() for frame in ImageSequence.Iterator(gif)]
+            gif = Image.open(f'{edited_gif_path}_all.gif')
+            st.session_state['all_frames'] = [frame.copy() for frame in ImageSequence.Iterator(gif)]
             st.session_state['edit_made'] = False
 
         if view_mode == "Static":
-            view_image = st.session_state[f'{ventricle}_frames'][0 if idx_label == "End-Diastole" else 1]
+            view_image = st.session_state['all_frames'][idx % len(st.session_state['all_frames'])]
             width = int(DISPLAY_W * 1.5)
         elif view_mode == "Viewer":
             view_image = image_slice
             width = int(DISPLAY_W)
 
-        st.image(view_image, width = width)
+        st.image(view_image, width=width)
 
 
 
